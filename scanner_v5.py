@@ -310,3 +310,4 @@ SOLO USO INFORMATIVO — NON CONSULENZA FINANZIARIA
 # Auto-refresh ogni 60 secondi
 time.sleep(60)
 st.rerun()
+
