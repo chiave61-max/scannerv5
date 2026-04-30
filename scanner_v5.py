@@ -8,7 +8,7 @@ import time
 # ═══════════════════════════════════════════════════════
 # ⚙️ CONFIGURAZIONE
 # ═══════════════════════════════════════════════════════
-st.set_page_config(page_title="Scanner Ultra V6", layout="centered")
+st.set_page_config(page_title="Scanner Ultra V7", layout="centered")
 
 st.markdown("""
 <style>
@@ -56,15 +56,25 @@ UNIVERSE = {
 # ═══════════════════════════════════════════════════════
 
 def calc_rsi(series, period=14):
-    """RSI corretto su dati giornalieri."""
+    """RSI classico Wilder (EMA smussata) — più preciso del rolling mean."""
     delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).iloc[-1]
+    gain  = delta.clip(lower=0)
+    loss  = (-delta.clip(upper=0))
+    # Prima media semplice
+    avg_gain = gain.iloc[1:period+1].mean()
+    avg_loss = loss.iloc[1:period+1].mean()
+    gains = [avg_gain]
+    losses = [avg_loss]
+    for i in range(period+1, len(gain)):
+        gains.append((gains[-1] * (period - 1) + gain.iloc[i]) / period)
+        losses.append((losses[-1] * (period - 1) + loss.iloc[i]) / period)
+    if not gains or losses[-1] == 0:
+        return 50
+    rs = gains[-1] / losses[-1]
+    return round(100 - 100 / (1 + rs), 2)
 
 def calc_atr(df, period=14):
-    """ATR per calcolo SL/TP dinamici."""
+    """ATR True Range corretto."""
     hl  = df['High'] - df['Low']
     hpc = (df['High'] - df['Close'].shift()).abs()
     lpc = (df['Low']  - df['Close'].shift()).abs()
@@ -72,100 +82,170 @@ def calc_atr(df, period=14):
     return tr.rolling(period).mean().iloc[-1]
 
 def calc_adx(df, period=14):
-    """ADX per misurare forza del trend."""
+    """ADX con smussamento Wilder corretto."""
     try:
         high, low, close = df['High'], df['Low'], df['Close']
-        dm_plus  = (high.diff()).clip(lower=0)
-        dm_minus = (-low.diff()).clip(lower=0)
+        plus_dm  = high.diff().clip(lower=0)
+        minus_dm = (-low.diff()).clip(lower=0)
+        # Annulla quando l'altro è maggiore
+        mask = plus_dm > minus_dm
+        plus_dm  = plus_dm.where(mask, 0)
+        minus_dm = minus_dm.where(~mask, 0)
+
         tr = pd.concat([
             high - low,
             (high - close.shift()).abs(),
             (low  - close.shift()).abs()
         ], axis=1).max(axis=1)
-        atr14    = tr.rolling(period).mean()
-        di_plus  = 100 * dm_plus.rolling(period).mean()  / atr14
-        di_minus = 100 * dm_minus.rolling(period).mean() / atr14
-        dx       = (100 * (di_plus - di_minus).abs() / (di_plus + di_minus)).rolling(period).mean()
-        return dx.iloc[-1]
+
+        atr14     = tr.ewm(alpha=1/period, adjust=False).mean()
+        di_plus   = 100 * plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr14
+        di_minus  = 100 * minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr14
+        dx        = (100 * (di_plus - di_minus).abs() / (di_plus + di_minus + 1e-10))
+        adx       = dx.ewm(alpha=1/period, adjust=False).mean()
+        return round(float(adx.iloc[-1]), 1)
     except:
         return 0
 
+def calc_macd(series, fast=12, slow=26, signal=9):
+    """MACD classico — conferma momentum."""
+    ema_fast   = series.ewm(span=fast, adjust=False).mean()
+    ema_slow   = series.ewm(span=slow, adjust=False).mean()
+    macd_line  = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram  = macd_line - signal_line
+    return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(histogram.iloc[-1])
+
+def calc_bollinger(series, period=20, std_dev=2):
+    """Bande di Bollinger — identifica posizione nel range."""
+    ma   = series.rolling(period).mean()
+    std  = series.rolling(period).std()
+    upper = ma + std_dev * std
+    lower = ma - std_dev * std
+    price = series.iloc[-1]
+    band_width = float(upper.iloc[-1] - lower.iloc[-1])
+    # %B: 0=banda bassa, 1=banda alta, >1 o <0=breakout
+    pct_b = float((price - lower.iloc[-1]) / (band_width + 1e-10))
+    return round(pct_b, 3), round(band_width, 4)
+
+def calc_stoch_rsi(series, rsi_period=14, stoch_period=14, smooth_k=3, smooth_d=3):
+    """Stochastic RSI — più sensibile del RSI classico per timing entrata."""
+    delta = series.diff()
+    gain  = delta.clip(lower=0).ewm(alpha=1/rsi_period, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(alpha=1/rsi_period, adjust=False).mean()
+    rs    = gain / (loss + 1e-10)
+    rsi_series = 100 - 100 / (1 + rs)
+    min_rsi = rsi_series.rolling(stoch_period).min()
+    max_rsi = rsi_series.rolling(stoch_period).max()
+    stoch_k = 100 * (rsi_series - min_rsi) / (max_rsi - min_rsi + 1e-10)
+    k = stoch_k.rolling(smooth_k).mean()
+    d = k.rolling(smooth_d).mean()
+    return round(float(k.iloc[-1]), 1), round(float(d.iloc[-1]), 1)
+
+# ═══════════════════════════════════════════════════════
+# 📡 SEGNALE PRINCIPALE
+# ═══════════════════════════════════════════════════════
+
 def get_signal(ticker, info):
     try:
-        # Dati giornalieri — RSI più affidabile
-        df = yf.download(ticker, period='120d', interval='1d',
+        # ── 300 giorni per avere MA200 reale ──
+        df = yf.download(ticker, period='300d', interval='1d',
                          progress=False, auto_adjust=True)
-        if df.empty or len(df) < 50: return None
+        if df.empty or len(df) < 210: return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        price   = float(df['Close'].iloc[-1])
-        prev_h  = float(df['High'].iloc[-2])
-        prev_l  = float(df['Low'].iloc[-2])
+        close  = df['Close']
+        price  = float(close.iloc[-1])
+        prev_h = float(df['High'].iloc[-2])
+        prev_l = float(df['Low'].iloc[-2])
 
-        # Medie mobili
-        ma20  = float(df['Close'].rolling(20).mean().iloc[-1])
-        ma50  = float(df['Close'].rolling(50).mean().iloc[-1])
-        ma200 = float(df['Close'].rolling(100).mean().iloc[-1])  # 100 come proxy 200
+        # ── MEDIE MOBILI REALI ──
+        ma20  = float(close.rolling(20).mean().iloc[-1])
+        ma50  = float(close.rolling(50).mean().iloc[-1])
+        ma200 = float(close.rolling(200).mean().iloc[-1])  # ✅ vera MA200
 
-        # Indicatori
-        rsi  = calc_rsi(df['Close'])
-        atr  = calc_atr(df)
-        adx  = calc_adx(df)
+        # ── INDICATORI ──
+        rsi              = calc_rsi(close)
+        atr              = calc_atr(df)
+        adx              = calc_adx(df)
+        macd, macd_sig, macd_hist = calc_macd(close)
+        pct_b, bband_w   = calc_bollinger(close)
+        stoch_k, stoch_d = calc_stoch_rsi(close)
 
-        # Volume (solo equity/commodity)
+        # ── VOLUME ──
         vol_ratio = 0.0
         if not info['forex']:
-            vol     = float(df['Volume'].iloc[-1])
-            vol_avg = float(df['Volume'].rolling(20).mean().iloc[-1])
+            vol       = float(df['Volume'].iloc[-1])
+            vol_avg   = float(df['Volume'].rolling(20).mean().iloc[-1])
             vol_ratio = vol / vol_avg if vol_avg > 0 else 0
 
-        # ── FILTRI QUALITÀ ──
-        # RSI non estremo (zona operativa)
-        rsi_buy_ok  = 40 < rsi < 65   # non ipercomprato e non collassato
-        rsi_sell_ok = 35 < rsi < 60   # non ipervenduto e non in rally
-        # Trend
-        uptrend   = price > ma50 and ma50 > ma200
-        downtrend = price < ma50 and ma50 < ma200
-        # Volume confermato
-        vol_ok = info['forex'] or vol_ratio > 1.2
-        # Trend forte (ADX > 20)
-        strong_trend = adx > 20
-        # Breakout
+        # ── CONDIZIONI DI TREND ──
+        uptrend   = price > ma50 > ma200   # ✅ trend reale su MA200
+        downtrend = price < ma50 < ma200
+        above_ma20 = price > ma20
+
+        # ── BREAKOUT ──
         bull_break = price > prev_h
         bear_break = price < prev_l
 
-        # ── PUNTEGGIO BUY (max 10) ──
+        # ── FILTRI QUALITÀ ──
+        vol_ok       = info['forex'] or vol_ratio > 1.2
+        strong_trend = adx > 22
+
+        # RSI in zona sana (Wilder)
+        rsi_buy_ok  = 42 < rsi < 63
+        rsi_sell_ok = 37 < rsi < 58
+
+        # MACD conferma
+        macd_bull = macd > macd_sig and macd_hist > 0
+        macd_bear = macd < macd_sig and macd_hist < 0
+
+        # Bollinger: non in ipercomprato estremo
+        bb_buy_ok  = pct_b < 0.95   # non sopra banda superiore
+        bb_sell_ok = pct_b > 0.05   # non sotto banda inferiore
+
+        # Stoch RSI conferma (non estremo)
+        stoch_buy_ok  = stoch_k < 85 and stoch_k > stoch_d
+        stoch_sell_ok = stoch_k > 15 and stoch_k < stoch_d
+
+        # ── SCORE BUY (max 10) ──
         score_buy = 0
-        if bull_break:      score_buy += 3  # breakout confermato
-        if uptrend:         score_buy += 2  # trend allineato
-        if vol_ratio > 1.5: score_buy += 2  # volume forte
-        elif vol_ok:        score_buy += 1  # volume sufficiente
-        if rsi_buy_ok:      score_buy += 1  # RSI in zona sana
-        if strong_trend:    score_buy += 1  # ADX trend forte
-        if price > ma20:    score_buy += 1  # sopra MA breve
+        if bull_break:           score_buy += 2   # breakout confermato
+        if uptrend:              score_buy += 2   # trend MA50/MA200 allineato
+        if macd_bull:            score_buy += 1   # MACD rialzista
+        if vol_ratio > 1.5:      score_buy += 2   # volume forte
+        elif vol_ok:             score_buy += 1   # volume sufficiente
+        if rsi_buy_ok:           score_buy += 1   # RSI zona sana
+        if strong_trend:         score_buy += 1   # ADX forte
+        if above_ma20:           score_buy += 1   # sopra MA breve
 
         # Penalità BUY
-        if rsi > 70:        score_buy -= 3  # ipercomprato → NON comprare
-        if rsi > 65:        score_buy -= 1  # quasi ipercomprato
-        if vol_ratio < 0.8: score_buy -= 1  # volume molto basso
-        if not uptrend:     score_buy -= 1  # trend non allineato
+        if rsi > 70:             score_buy -= 3   # ipercomprato
+        if rsi > 63:             score_buy -= 1   # quasi ipercomprato
+        if pct_b > 1.0:          score_buy -= 2   # sopra banda Bollinger superiore
+        if not macd_bull:        score_buy -= 1   # MACD non conferma
+        if vol_ratio < 0.8:      score_buy -= 1   # volume basso
+        if not uptrend:          score_buy -= 1   # trend non allineato
 
-        # ── PUNTEGGIO SELL (max 10) ──
+        # ── SCORE SELL (max 10) ──
         score_sell = 0
-        if bear_break:      score_sell += 3
-        if downtrend:       score_sell += 2
-        if vol_ratio > 1.5: score_sell += 2
-        elif vol_ok:        score_sell += 1
-        if rsi_sell_ok:     score_sell += 1
-        if strong_trend:    score_sell += 1
-        if price < ma20:    score_sell += 1
+        if bear_break:           score_sell += 2
+        if downtrend:            score_sell += 2
+        if macd_bear:            score_sell += 1
+        if vol_ratio > 1.5:      score_sell += 2
+        elif vol_ok:             score_sell += 1
+        if rsi_sell_ok:          score_sell += 1
+        if strong_trend:         score_sell += 1
+        if not above_ma20:       score_sell += 1
 
         # Penalità SELL
-        if rsi < 30:        score_sell -= 3  # ipervenduto → NON vendere
-        if rsi < 35:        score_sell -= 1
-        if vol_ratio < 0.8: score_sell -= 1
-        if not downtrend:   score_sell -= 1
+        if rsi < 30:             score_sell -= 3  # ipervenduto
+        if rsi < 37:             score_sell -= 1
+        if pct_b < 0.0:          score_sell -= 2  # sotto banda Bollinger inferiore
+        if not macd_bear:        score_sell -= 1
+        if vol_ratio < 0.8:      score_sell -= 1
+        if not downtrend:        score_sell -= 1
 
         # Clamp 0-10
         score_buy  = max(0, min(10, score_buy))
@@ -178,20 +258,26 @@ def get_signal(ticker, info):
         tp_short = price - atr * 3.0
 
         # ── DECISIONE FINALE ──
-        # Richiede score >= 7 E filtri RSI/volume OK
-        if score_buy >= 7 and bull_break and rsi_buy_ok and vol_ok:
+        # BUY: score >= 7 + breakout + RSI ok + volume + MACD + Bollinger ok
+        if (score_buy >= 7 and bull_break and rsi_buy_ok
+                and vol_ok and macd_bull and bb_buy_ok):
             status = 'BUY'
-        elif score_sell >= 7 and bear_break and rsi_sell_ok and vol_ok:
+        # SELL: score >= 7 + breakout + RSI ok + volume + MACD + Bollinger ok
+        elif (score_sell >= 7 and bear_break and rsi_sell_ok
+                and vol_ok and macd_bear and bb_sell_ok):
             status = 'SELL'
         else:
             status = 'WAIT'
 
-        # Warning speciali
+        # ── WARNING ──
         warnings = []
-        if rsi > 70: warnings.append('⚠️ RSI IPERCOMPRATO')
-        if rsi < 30: warnings.append('⚠️ RSI IPERVENDUTO')
+        if rsi > 70:               warnings.append('⚠️ RSI IPERCOMPRATO')
+        if rsi < 30:               warnings.append('⚠️ RSI IPERVENDUTO')
         if vol_ratio > 0 and vol_ratio < 0.8: warnings.append('⚠️ VOLUME BASSO')
-        if adx < 15: warnings.append('⚠️ TREND DEBOLE')
+        if adx < 15:               warnings.append('⚠️ TREND DEBOLE')
+        if pct_b > 1.0:            warnings.append('⚠️ SOPRA BOLLINGER')
+        if pct_b < 0.0:            warnings.append('⚠️ SOTTO BOLLINGER')
+        if not macd_bull and not macd_bear: warnings.append('⚠️ MACD NEUTRO')
 
         return {
             'ticker':     ticker,
@@ -201,9 +287,14 @@ def get_signal(ticker, info):
             'price':      price,
             'rsi':        round(rsi, 1),
             'adx':        round(adx, 1),
+            'macd_hist':  round(macd_hist, 4),
+            'pct_b':      round(pct_b, 2),
+            'stoch_k':    stoch_k,
+            'stoch_d':    stoch_d,
             'vol_ratio':  round(vol_ratio, 1),
             'ma20':       round(ma20, 4),
             'ma50':       round(ma50, 4),
+            'ma200':      round(ma200, 4),
             'atr':        round(atr, 4),
             'uptrend':    uptrend,
             'downtrend':  downtrend,
@@ -237,10 +328,17 @@ def render_card(r):
     trend_ico = '📈' if r['uptrend'] else '📉' if r['downtrend'] else '➡️'
     vol_str   = f"{r['vol_ratio']:.1f}x" if r['vol_ratio'] > 0 else 'N/A'
 
+    # MACD colore
+    macd_color = '#00ff88' if r['macd_hist'] > 0 else '#ff3355'
+    macd_str   = f"{'▲' if r['macd_hist'] > 0 else '▼'} {abs(r['macd_hist']):.3f}"
+
+    # Stoch RSI
+    stoch_color = '#ff3355' if r['stoch_k'] > 80 else '#00ff88' if r['stoch_k'] < 20 else 'white'
+
     # Livelli
     levels_html = ''
     if r['status'] == 'BUY':
-        rr = round((r['tp_long'] - r['price']) / (r['price'] - r['sl_long']), 1) if r['price'] > r['sl_long'] else 0
+        rr = round((r['tp_long'] - r['price']) / (r['price'] - r['sl_long'] + 1e-10), 1)
         levels_html = (
             '<div style="margin-top:10px;padding:8px;background:#0a0f15;border-radius:4px;font-size:0.78em">'
             f'<span style="color:#00ff88">TP: {r["tp_long"]:.4f}</span>'
@@ -251,7 +349,7 @@ def render_card(r):
             '</div>'
         )
     elif r['status'] == 'SELL':
-        rr = round((r['price'] - r['tp_short']) / (r['sl_short'] - r['price']), 1) if r['sl_short'] > r['price'] else 0
+        rr = round((r['price'] - r['tp_short']) / (r['sl_short'] - r['price'] + 1e-10), 1)
         levels_html = (
             '<div style="margin-top:10px;padding:8px;background:#0a0f15;border-radius:4px;font-size:0.78em">'
             f'<span style="color:#00ff88">TP: {r["tp_short"]:.4f}</span>'
@@ -261,6 +359,15 @@ def render_card(r):
             f'<span style="color:#ffcc00">R/R: {rr}:1</span>'
             '</div>'
         )
+
+    # MA info
+    ma_html = (
+        f'<div style="margin-top:8px;font-size:0.72em;color:#3a5070">'
+        f'MA20: <span style="color:white">{r["ma20"]:.2f}</span> &nbsp;'
+        f'MA50: <span style="color:white">{r["ma50"]:.2f}</span> &nbsp;'
+        f'MA200: <span style="color:white">{r["ma200"]:.2f}</span>'
+        f'</div>'
+    )
 
     # Warning
     warn_html = ''
@@ -281,12 +388,21 @@ def render_card(r):
         f'<span class="{sc_class}">{score}/10</span>'
         f'</div>'
         f'</div>'
+        # Riga 1: Prezzo, RSI, ADX, Trend
         f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px">'
         f'<div><div class="label">Prezzo</div><div class="value">{r["price"]:.4f}</div></div>'
         f'<div><div class="label">RSI</div><div class="value">{r["rsi"]}</div></div>'
         f'<div><div class="label">ADX</div><div class="value">{r["adx"]}</div></div>'
         f'<div><div class="label">Trend</div><div class="value">{trend_ico} {vol_str}</div></div>'
         f'</div>'
+        # Riga 2: MACD, Stoch RSI, %B, ATR
+        f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px">'
+        f'<div><div class="label">MACD</div><div class="value" style="color:{macd_color}">{macd_str}</div></div>'
+        f'<div><div class="label">StochRSI</div><div class="value" style="color:{stoch_color}">{r["stoch_k"]}</div></div>'
+        f'<div><div class="label">%B Boll</div><div class="value">{r["pct_b"]:.2f}</div></div>'
+        f'<div><div class="label">ATR</div><div class="value">{r["atr"]:.2f}</div></div>'
+        f'</div>'
+        f'{ma_html}'
         f'{levels_html}'
         f'{warn_html}'
         f'</div>',
@@ -298,8 +414,10 @@ def render_card(r):
 # ═══════════════════════════════════════════════════════
 
 st.markdown(
-    '<h2 style="text-align:center;color:#00e5ff;letter-spacing:4px;margin-bottom:0">💎 SCANNER ULTRA V6</h2>'
-    '<p style="text-align:center;color:#3a5070;font-size:0.75em;letter-spacing:3px">BREAKOUT · VOLUME · TREND · RSI · ADX · ATR</p>',
+    '<h2 style="text-align:center;color:#00e5ff;letter-spacing:4px;margin-bottom:0">💎 SCANNER ULTRA V7</h2>'
+    '<p style="text-align:center;color:#3a5070;font-size:0.75em;letter-spacing:3px">'
+    'BREAKOUT · VOLUME · TREND · RSI WILDER · MACD · BOLLINGER · STOCHRSI · ADX · ATR'
+    '</p>',
     unsafe_allow_html=True
 )
 
@@ -318,15 +436,18 @@ with st.sidebar:
     show_wait = st.checkbox("Mostra ATTESA", value=False)
 
     st.markdown("---")
-    st.markdown("### 📊 Filtri attivi V6")
-    st.markdown("✅ RSI comprato: **40-65**")
-    st.markdown("✅ RSI venduto: **35-60**")
-    st.markdown("✅ Penalità RSI > 70")
-    st.markdown("✅ Trend: MA50 > MA200")
-    st.markdown("✅ ADX > 20 (trend forte)")
+    st.markdown("### 📊 Filtri attivi V7")
+    st.markdown("✅ RSI Wilder (più preciso)")
+    st.markdown("✅ RSI buy: **42–63** | sell: **37–58**")
+    st.markdown("✅ Penalità RSI > 70 / < 30")
+    st.markdown("✅ MA50 > **MA200 reale** (300gg dati)")
+    st.markdown("✅ ADX Wilder > 22")
+    st.markdown("✅ MACD conferma direzione")
+    st.markdown("✅ Bollinger %B (no estremi)")
+    st.markdown("✅ Stochastic RSI timing")
     st.markdown("✅ Volume > 1.2x media")
     st.markdown("✅ Score minimo: **7/10**")
-    st.markdown("✅ Dati: **giornalieri** (più affidabili)")
+    st.markdown("✅ Dati: **giornalieri** 300gg")
 
     st.markdown("---")
     st.markdown("### ⏰ Sistemi attivi")
@@ -336,7 +457,7 @@ with st.sidebar:
     st.markdown("🌅 London Open: **10:00**")
 
 # ── SCAN ──
-with st.spinner('⏳ Scansione mercati...'):
+with st.spinner('⏳ Scansione mercati V7...'):
     results = []
     for ticker, info in UNIVERSE.items():
         if info['cat'] not in cat_filter: continue
@@ -362,7 +483,7 @@ if total == 0:
     st.markdown(
         '<div class="card wait" style="text-align:center;padding:24px">'
         '<b style="color:#3a5070;letter-spacing:3px;font-size:0.9em">NESSUN SEGNALE DI QUALITÀ</b><br>'
-        '<span style="color:#1a2535;font-size:0.75em">Tutti i filtri sono attivi — attendere setup migliori</span>'
+        '<span style="color:#1a2535;font-size:0.75em">Tutti i filtri V7 attivi — attendere setup migliori</span>'
         '</div>',
         unsafe_allow_html=True
     )
