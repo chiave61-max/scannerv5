@@ -587,4 +587,4 @@ st.markdown(
     'SOLO USO INFORMATIVO — NON CONSULENZA FINANZIARIA — AGGIORNA CALENDARIO SETTIMANALMENTE'
     '</p>',
     unsafe_allow_html=True
-)i
+)
