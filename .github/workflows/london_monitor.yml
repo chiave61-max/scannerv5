@@ -1,0 +1,35 @@
+name: London Breakout Monitor
+
+on:
+  schedule:
+    # Esegui ogni ora dalle 07:00 alle 13:00 UTC (09:00-15:00 ora italiana)
+    # Solo Mer e Gio — il codice Python gestisce il filtro giorni
+    - cron: '0 7 * * 3'   # Mercoledi 07:00 UTC
+    - cron: '0 8 * * 3'   # Mercoledi 08:00 UTC
+    - cron: '0 9 * * 3'   # Mercoledi 09:00 UTC
+    - cron: '0 10 * * 3'  # Mercoledi 10:00 UTC
+    - cron: '0 12 * * 3'  # Mercoledi 12:00 UTC (reminder chiusura)
+    - cron: '0 7 * * 4'   # Giovedi 07:00 UTC
+    - cron: '0 8 * * 4'   # Giovedi 08:00 UTC
+    - cron: '0 9 * * 4'   # Giovedi 09:00 UTC
+    - cron: '0 10 * * 4'  # Giovedi 10:00 UTC
+    - cron: '0 12 * * 4'  # Giovedi 12:00 UTC (reminder chiusura)
+  workflow_dispatch:       # Permette esecuzione manuale dal browser
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy requests pytz
+
+      - name: Run London Monitor
+        run: python london_monitor.py
